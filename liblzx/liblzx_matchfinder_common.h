@@ -33,6 +33,15 @@
 #include "liblzx_unaligned.h"
 
 /*
+ * Запас позиций matchfinder в потоковом режиме сверх удвоенного окна.
+ * Буфер потокового компрессора содержит до 2 * window_size байт истории и
+ * текущего фрагмента плюс заглядывание вперёд (LZX_MAX_MATCH_LEN +
+ * LZX_E8_FILTER_TAIL_SIZE = 267 байт), а ленивый разбор вставляет в цепочки
+ * и позицию конца фрагмента.  Без запаса запись шла за конец таблицы.
+ */
+#define MF_STREAMING_EXTRA_POSITIONS 512
+
+/*
  * Given a 32-bit value that was loaded with the platform's native endianness,
  * return a 32-bit value whose high-order 8 bits are 0 and whose low-order 24
  * bits contain the first 3 bytes, arranged in octets in a platform-dependent

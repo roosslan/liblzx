@@ -144,11 +144,14 @@ TEMPLATED(matchfinder_rebase)(mf_pos_t * mf_base, size_t count,
 static attrib_forceinline size_t
 TEMPLATED(bt_matchfinder_size)(size_t max_bufsize, bool streaming)
 {
-        const size_t streaming_bufsize_mul = streaming ? 4 : 2;
+        /* Два дочерних узла на позицию */
+        const size_t num_positions = streaming
+                ? max_bufsize * 2 + MF_STREAMING_EXTRA_POSITIONS
+                : max_bufsize;
 
         const size_t base_size =
             sizeof(struct TEMPLATED(bt_matchfinder)) +
-            (streaming_bufsize_mul * max_bufsize * sizeof(mf_pos_t));
+            (2 * num_positions * sizeof(mf_pos_t));
 
         return base_size;
 }

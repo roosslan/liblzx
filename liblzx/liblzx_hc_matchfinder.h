@@ -150,10 +150,12 @@ struct TEMPLATED(hc_matchfinder) {
 static attrib_forceinline size_t
 TEMPLATED(hc_matchfinder_size)(size_t max_bufsize, bool streaming)
 {
-        const size_t streaming_mul = streaming ? 2 : 1;
+        const size_t num_positions = streaming
+                ? max_bufsize * 2 + MF_STREAMING_EXTRA_POSITIONS
+                : max_bufsize;
 
         return sizeof(struct TEMPLATED(hc_matchfinder)) +
-               (max_bufsize * streaming_mul * sizeof(mf_pos_t));
+               (num_positions * sizeof(mf_pos_t));
 }
 
 /* Prepare the matchfinder for a new input buffer.  */
@@ -354,10 +356,15 @@ TEMPLATED(hc_matchfinder_longest_match)(struct TEMPLATED(hc_matchfinder) * const
                         goto out;
         }
 out:
+        /* Раньше здесь длина меньше 2 заменялась на 2.  Если совпадение не
+         * найдено, best_matchptr == in_next и смещение равно 0; при поиске
+         * совпадения в следующей позиции (best_len = cur_len - 2 = 1)
+         * ленивый разбор принимал такую «длину 2» за лучшее совпадение, и
+         * смещение 0 превращалось в повтор R2 — данные портились.  Теперь,
+         * как в wimlib, при отсутствии совпадения возвращается исходная
+         * best_len, и вызывающий код отличает этот случай. */
         *offset_ret = in_next - best_matchptr;
         best_len = min_u32(best_len, max_produce_len);
-        if (best_len < 2)
-                best_len = 2;
 
         return best_len;
 }
@@ -393,7 +400,11 @@ TEMPLATED(hc_matchfinder_skip_bytes)(struct TEMPLATED(hc_matchfinder) * const mf
         uint32_t next_hashseq;
         uint32_t remaining = count;
 
-        if (unlikely(count + HC_MATCHFINDER_REQUIRED_NBYTES > in_end - in_next))
+        /* count == 0 возможно у конца фрагмента: ленивый разбор выбирает
+         * совпадение длины 2, укороченное до границы фрагмента.  Цикл ниже
+         * при count == 0 переполнил бы счётчик и вышел за пределы буфера. */
+        if (unlikely(count == 0 ||
+                     count + HC_MATCHFINDER_REQUIRED_NBYTES > in_end - in_next))
                 return;
 
         cur_pos = in_next - in_begin;

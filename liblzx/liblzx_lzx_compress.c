@@ -189,8 +189,7 @@
 #include "liblzx.h"
 
 #include <assert.h>
-
-#include <malloc.h>
+#include <string.h>
 
 /* Note: BT_MATCHFINDER_HASH2_ORDER must be defined before including
  * bt_matchfinder.h. */
@@ -565,12 +564,18 @@ struct liblzx_compressor {
  * also want to optimize out the use of offset_slot_tab_2 in the 16-bit case.
  * This requires that the limit be no more than the length of offset_slot_tab_1
  * (currently 32768).
+ *
+ * В потоковом режиме (CAB) буфер хранит до двух окон истории и заглядывание
+ * вперёд, поэтому позиции превышают 65535 даже при окне 32 Кб: 16-битные
+ * позиции переполнялись (65536 превращалось в 0, а 65535 совпадает с
+ * MF_INVALID_POS).  Поэтому 16-битные matchfinder используются только без
+ * потокового режима.
  */
 static attrib_forceinline bool
-lzx_is_16_bit(size_t max_bufsize)
+lzx_is_16_bit(size_t max_bufsize, bool streaming)
 {
         STATIC_ASSERT(ARRAY_LEN(((struct liblzx_compressor *)0)->offset_slot_tab_1) == 32768);
-        return max_bufsize <= 32768;
+        return !streaming && max_bufsize <= 32768;
 }
 
 /*
@@ -924,12 +929,16 @@ lzx_write_compressed_code(struct lzx_output_bitstream *os,
         uint32_t precode_freqs[LZX_PRECODE_NUM_SYMBOLS];
         uint8_t precode_lens[LZX_PRECODE_NUM_SYMBOLS];
         uint32_t precode_codewords[LZX_PRECODE_NUM_SYMBOLS];
-        unsigned *precode_items = (unsigned *)alloca(sizeof(unsigned) * num_lens);
+        /* Каждый элемент описывает хотя бы одну длину кодового слова, поэтому
+         * элементов не больше num_lens; вместо alloca используется массив
+         * фиксированного размера, рассчитанный на самый большой код. */
+        unsigned precode_items[LZX_MAINCODE_MAX_NUM_SYMBOLS];
         unsigned num_precode_items;
         unsigned precode_item;
         unsigned precode_sym;
         unsigned i;
         uint8_t saved = lens[num_lens];
+        assert(num_lens <= LZX_MAINCODE_MAX_NUM_SYMBOLS);
         *(uint8_t *)(lens + num_lens) = 0x80;
 
         for (i = 0; i < LZX_PRECODE_NUM_SYMBOLS; i++)
@@ -2230,7 +2239,9 @@ log2_fixed_fast_normalized(const fixed32 *value, int multiplier_bits)
                 mantissa_log2 += log2_fixed_table_1[mantissa_byte - 1];
         }
 
-        final_log = (int64_t)mantissa_log2 + ((int64_t)base_pos << 32);
+        /* Умножение вместо сдвига: base_pos может быть отрицательным, а
+         * сдвиг влево отрицательного числа — неопределённое поведение. */
+        final_log = (int64_t)mantissa_log2 + (int64_t)base_pos * ((int64_t)1 << 32);
         final_log /= ((int64_t)1 << (32 - multiplier_bits));
 
         return (int32_t)final_log;
@@ -2317,7 +2328,20 @@ static const uint16_t lzx_default_len_costs[LZX_LENCODE_NUM_SYMBOLS] = {
 static void
 fixed_rcp_approx(fixed32frac *result, uint32_t i)
 {
-        result->value = ((uint64_t)0x100000000ull) / i;
+        /* В wimlib здесь было деление в плавающей точке, и нулевой
+         * знаменатель (блок без совпадений) давал бесконечность, которая
+         * затем не использовалась.  Целочисленное деление на ноль аварийно
+         * завершает процесс, поэтому ноль даёт нулевую обратную величину:
+         * при отсутствии совпадений частоты aligned-символов тоже нулевые, и
+         * результат не участвует в расчёте стоимостей.  При i == 1
+         * результат 2^32 не помещается в поле и раньше обращался в ноль;
+         * теперь он ограничивается наибольшим значением (почти 1.0). */
+        if (i == 0)
+                result->value = 0;
+        else if (i == 1)
+                result->value = 0xFFFFFFFFu;
+        else
+                result->value = (uint32_t)(((uint64_t)0x100000000ull) / i);
 }
 
 static void
@@ -2355,7 +2379,9 @@ fixed_add_frac(fixed32 *result, const fixed32 *a, const fixed32frac *b)
 static void
 fixed_sub(fixed32 *result, const fixed32 *a, const fixed32 *b)
 {
-        result->value = a->value + b->value;
+        /* Вычитание с насыщением: результат используется как вероятность
+         * совпадения и не должен «переворачиваться» через ноль. */
+        result->value = (a->value > b->value) ? a->value - b->value : 0;
 }
 
 static void
@@ -2585,11 +2611,12 @@ lzx_compress_near_optimal(struct liblzx_compressor * restrict c,
         uint32_t next_hashes[2] = {0, 0};
         struct lzx_lru_queue queue;
 
-        if (max_offset >= LZX_MAX_WINDOW_SIZE) {
-                /* Slightly shrink window to avoid offset values that are
-                 * greater than 21 bits. */
-                max_offset = LZX_MAX_WINDOW_SIZE - 1 - LZX_OFFSET_ADJUSTMENT;
-        }
+        /* Формат не допускает смещений больше window_size - 3 (см.
+         * lzx_get_num_main_syms): иначе слот смещения выходит за пределы
+         * основного алфавита.  Раньше ограничение применялось только к
+         * окну 2 Мб, и при окнах 15..20 в потоковом режиме могли
+         * появляться недопустимые символы. */
+        max_offset = c->window_size - LZX_MIN_MATCH_LEN - 1;
 
         in_begin -= c->in_prefix_size;
 
@@ -2959,6 +2986,7 @@ lzx_explicit_offset_match_score(unsigned len, uint32_t adjusted_offset)
 static attrib_forceinline unsigned
 lzx_repeat_offset_match_score(unsigned rep_len, unsigned rep_idx)
 {
+        (void)rep_idx;
         return rep_len + 3;
 }
 
@@ -3013,11 +3041,12 @@ lzx_compress_lazy(struct liblzx_compressor * restrict c,
         uint32_t recent_offsets[LZX_NUM_RECENT_OFFSETS];
         uint32_t next_hashes[2];
 
-        if (max_offset >= LZX_MAX_WINDOW_SIZE) {
-                /* Slightly shrink window to avoid offset values that are
-                 * greater than 21 bits. */
-                max_offset = LZX_MAX_WINDOW_SIZE - 1 - LZX_OFFSET_ADJUSTMENT;
-        }
+        /* Формат не допускает смещений больше window_size - 3 (см.
+         * lzx_get_num_main_syms): иначе слот смещения выходит за пределы
+         * основного алфавита.  Раньше ограничение применялось только к
+         * окну 2 Мб, и при окнах 15..20 в потоковом режиме могли
+         * появляться недопустимые символы. */
+        max_offset = c->window_size - LZX_MIN_MATCH_LEN - 1;
 
         in_begin -= c->in_prefix_size;
 
@@ -3314,8 +3343,8 @@ lzx_init_offset_slot_tabs(struct liblzx_compressor *c)
         for (; adjusted_offset < ARRAY_LEN(c->offset_slot_tab_1);
              adjusted_offset++)
         {
-                if (adjusted_offset >= lzx_offset_slot_base[slot + 1] +
-                                       LZX_OFFSET_ADJUSTMENT)
+                if (adjusted_offset >= (uint32_t)(lzx_offset_slot_base[slot + 1] +
+                                                  LZX_OFFSET_ADJUSTMENT))
                         slot++;
                 c->offset_slot_tab_1[adjusted_offset] = slot;
         }
@@ -3324,8 +3353,8 @@ lzx_init_offset_slot_tabs(struct liblzx_compressor *c)
         for (; adjusted_offset < LZX_MAX_WINDOW_SIZE;
              adjusted_offset += (uint32_t)1 << 14)
         {
-                if (adjusted_offset >= lzx_offset_slot_base[slot + 1] +
-                                       LZX_OFFSET_ADJUSTMENT)
+                if (adjusted_offset >= (uint32_t)(lzx_offset_slot_base[slot + 1] +
+                                                  LZX_OFFSET_ADJUSTMENT))
                         slot++;
                 c->offset_slot_tab_2[adjusted_offset >> 14] = slot;
         }
@@ -3343,14 +3372,14 @@ lzx_get_compressor_size(size_t window_size, unsigned compression_level,
 {
 
         if (compression_level <= MAX_FAST_LEVEL) {
-                if (lzx_is_16_bit(window_size))
+                if (lzx_is_16_bit(window_size, streaming))
                         return offsetof(struct liblzx_compressor, hc_mf_16) +
                                hc_matchfinder_size_16(window_size, streaming);
                 else
                         return offsetof(struct liblzx_compressor, hc_mf_32) +
                                hc_matchfinder_size_32(window_size, streaming);
         } else {
-                if (lzx_is_16_bit(window_size))
+                if (lzx_is_16_bit(window_size, streaming))
                         return offsetof(struct liblzx_compressor, bt_mf_16) +
                                bt_matchfinder_size_16(window_size, streaming);
                 else
@@ -3384,6 +3413,14 @@ lzx_reset(struct liblzx_compressor *c)
         /* Reset next hashes */
         c->next_hashes[0] = 0;
         c->next_hashes[1] = 0;
+
+        /* Сброс состояния потока: без этого после liblzx_compress_end_input
+         * объект не принимал новые данные (flushing оставался true), а
+         * новый поток не начинался с заголовка E8. */
+        c->first_block = true;
+        c->flushing = false;
+        c->in_used = 0;
+        c->out_chunk.size = 0;
 
         /* Reset algorithm-specific things */
         c->reset(c);
@@ -3457,7 +3494,7 @@ liblzx_compress_create(const struct liblzx_compress_properties *props)
         if (props->compression_level <= MAX_FAST_LEVEL) {
 
                 /* Fast compression: Use lazy parsing. */
-                if (lzx_is_16_bit(props->window_size)) {
+                if (lzx_is_16_bit(props->window_size, streaming)) {
                         c->reset = lzx_reset_lazy_16;
                         c->impl = lzx_compress_lazy_16;
                         c->cull = lzx_cull_lazy_16;
@@ -3479,7 +3516,7 @@ liblzx_compress_create(const struct liblzx_compress_properties *props)
         } else {
 
                 /* Normal / high compression: Use near-optimal parsing. */
-                if (lzx_is_16_bit(c->window_size)) {
+                if (lzx_is_16_bit(c->window_size, streaming)) {
                         c->reset = lzx_reset_near_optimal_16;
                         c->impl = lzx_compress_near_optimal_16;
                         c->cull = lzx_cull_near_optimal_16;
@@ -3524,10 +3561,95 @@ oom0:
         return NULL;
 }
 
+/*
+ * Записывает фрагмент как несжатый блок LZX (тип 3).  Используется, если
+ * сжатое представление фрагмента не поместилось в выходной буфер: иначе
+ * lzx_flush_output вернула бы 0 и данные фрагмента были бы потеряны.
+ *
+ * Структура блока: 3 бита типа, 24 бита размера, выравнивание на 16 бит
+ * (если поток уже выровнен, декодер пропускает целое 16-битное слово),
+ * затем R0, R1, R2 по 32 бита little-endian, сами данные и байт
+ * выравнивания при нечётном размере.
+ */
+static size_t
+lzx_write_uncompressed_chunk(struct liblzx_compressor *c, const uint8_t *in,
+                             uint32_t chunk_size)
+{
+        struct lzx_output_bitstream os;
+        unsigned i;
+
+        lzx_init_output(&os, c->out_buffer, c->out_buffer_capacity);
+
+        if (c->variant != LIBLZX_VARIANT_WIM && c->first_block) {
+                lzx_write_header(c->e8_file_size, &os);
+                c->first_block = false;
+        }
+
+        lzx_write_bits(&os, LZX_BLOCKTYPE_UNCOMPRESSED, 3);
+        if (c->variant == LIBLZX_VARIANT_WIM &&
+            chunk_size == LZX_DEFAULT_BLOCK_SIZE) {
+                lzx_write_bits(&os, 1, 1);
+        } else {
+                if (c->variant == LIBLZX_VARIANT_WIM)
+                        lzx_write_bits(&os, 0, 1);
+                if (c->variant != LIBLZX_VARIANT_WIM || c->window_order >= 16)
+                        lzx_write_bits(&os, chunk_size >> 16, 8);
+                lzx_write_bits(&os, chunk_size & 0xFFFF, 16);
+        }
+
+        /* Выравнивание: 1..16 нулевых бит */
+        lzx_write_bits(&os, 0, 16 - os.bitcount);
+
+        if ((size_t)(os.end - os.next) <
+            LZX_NUM_RECENT_OFFSETS * 4 + chunk_size + 1)
+                return 0;
+
+        for (i = 0; i < LZX_NUM_RECENT_OFFSETS; i++) {
+                put_unaligned_le32(c->lru_queue[i], os.next);
+                os.next += 4;
+        }
+
+        memcpy(os.next, in, chunk_size);
+        os.next += chunk_size;
+        if (chunk_size & 1)
+                *os.next++ = 0;
+
+        return os.next - os.start;
+}
+
+/* Размер, который займёт фрагмент, записанный lzx_write_uncompressed_chunk. */
+static size_t
+lzx_uncompressed_chunk_size(const struct liblzx_compressor *c,
+                            uint32_t chunk_size, bool first_block)
+{
+        unsigned bits = 3;      /* тип блока */
+
+        if (c->variant != LIBLZX_VARIANT_WIM) {
+                if (first_block)
+                        bits += (c->e8_file_size != 0) ? 33 : 1;
+                bits += 24;
+        } else if (chunk_size == LZX_DEFAULT_BLOCK_SIZE) {
+                bits += 1;
+        } else {
+                bits += 1 + ((c->window_order >= 16) ? 8 : 0) + 16;
+        }
+        /* Выравнивание на 16 бит: 1..16 бит */
+        bits += 16 - (bits % 16);
+
+        return bits / 8 + LZX_NUM_RECENT_OFFSETS * 4 + chunk_size +
+               (chunk_size & 1);
+}
+
 /* Compress a buffer of data. */
 static size_t
 lzx_compress_chunk(struct liblzx_compressor *c)
 {
+        /* Состояние, которое нужно восстановить, если сжатый фрагмент
+         * не поместится в выходной буфер. */
+        struct lzx_lens saved_prev_lens;
+        uint32_t saved_lru_queue[LZX_NUM_RECENT_OFFSETS];
+        unsigned saved_codes_index = c->codes_index;
+        bool saved_first_block = c->first_block;
         struct lzx_output_bitstream os;
         size_t result;
         bool e8_preprocess_enabled = (c->e8_chunk_offset < 0x40000000);
@@ -3537,6 +3659,10 @@ lzx_compress_chunk(struct liblzx_compressor *c)
         uint32_t next_chunk_preprocess_size = 0;
 
         uint8_t *in = (uint8_t *)c->in_buffer + c->in_prefix_size;
+
+        memcpy(&saved_prev_lens, &c->codes[c->codes_index ^ 1].lens,
+               sizeof(saved_prev_lens));
+        memcpy(saved_lru_queue, c->lru_queue, sizeof(saved_lru_queue));
 
         /* Preprocess the input data. */
         if (e8_preprocess_enabled) {
@@ -3573,6 +3699,31 @@ lzx_compress_chunk(struct liblzx_compressor *c)
 
         /* Flush the output bitstream. */
         result = lzx_flush_output(&os);
+
+#ifdef LIBLZX_TEST_FORCE_UNCOMPRESSED
+        /* Тестовый режим: каждый LIBLZX_TEST_FORCE_UNCOMPRESSED-й фрагмент
+         * записывается несжатым блоком, чтобы проверить этот путь
+         * распаковщиками. */
+        if ((c->e8_chunk_offset / c->chunk_size) %
+                    LIBLZX_TEST_FORCE_UNCOMPRESSED == 1)
+                result = 0;
+#endif
+
+        if (result == 0 ||
+            result > lzx_uncompressed_chunk_size(c, chunk_size,
+                                                 saved_first_block)) {
+                /* Сжатые данные не поместились или получились длиннее
+                 * несжатого блока (несжимаемые данные): откат кодов
+                 * Хаффмана и очереди смещений к состоянию до фрагмента и
+                 * запись несжатого блока.  Несжатый блок не меняет длины
+                 * кодов у декодера, а очередь смещений задаёт явно. */
+                c->codes_index = saved_codes_index;
+                memcpy(&c->codes[c->codes_index ^ 1].lens, &saved_prev_lens,
+                       sizeof(saved_prev_lens));
+                memcpy(c->lru_queue, saved_lru_queue, sizeof(saved_lru_queue));
+                c->first_block = saved_first_block;
+                result = lzx_write_uncompressed_chunk(c, in, chunk_size);
+        }
 
         /* Update the E8 chunk offset. */
         c->e8_chunk_offset += (uint32_t)chunk_size;

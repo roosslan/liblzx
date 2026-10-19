@@ -42,6 +42,20 @@
 #include <stddef.h>
 
 #pragma warning(error:4013)
+
+/* Ключевое слово restrict из C99: MSVC понимает его только в режиме /std:c11
+ * и новее, поэтому используется встроенное __restrict. */
+#  ifndef restrict
+#    define restrict __restrict
+#  endif
+
+/* Все платформы, поддерживаемые MSVC (x86, x64, ARM, ARM64), используют
+ * порядок байт little-endian, а __BYTE_ORDER__ компилятор не определяет. */
+#  ifndef __BYTE_ORDER__
+#    define __BYTE_ORDER__ 1234
+#    define __ORDER_LITTLE_ENDIAN__ 1234
+#    define __ORDER_BIG_ENDIAN__ 4321
+#  endif
 #endif
 
 #ifndef __ORDER_LITTLE_ENDIAN__
@@ -56,10 +70,13 @@
 /* Is the compiler GCC of the specified version or later?  This always returns
  * false for clang, since clang is "frozen" at GNUC 4.2.  The __has_*
  * feature-test macros should be used to detect clang functionality instead.  */
-#define GCC_PREREQ(major, minor)                                        \
-        (!defined(__clang__) && !defined(__INTEL_COMPILER) &&                \
-         (__GNUC__ > major ||                                                \
-          (__GNUC__ == major && __GNUC_MINOR__ >= minor)))
+/* Оператор defined внутри макроса, раскрываемого в #if, непереносим
+ * (-Wexpansion-to-defined), поэтому проверка компилятора вынесена наружу. */
+#if defined(__GNUC__) && !defined(__clang__) && !defined(__INTEL_COMPILER)
+#  define GCC_PREREQ(major, minor) (__GNUC__ > (major) || (__GNUC__ == (major) && __GNUC_MINOR__ >= (minor)))
+#else
+#  define GCC_PREREQ(major, minor) 0
+#endif
 
 /* Feature-test macros defined by recent versions of clang.  */
 #ifndef __has_attribute
@@ -121,15 +138,26 @@
 #endif
 
 /* Prefetch into L1 cache for read.  */
+/* Для MSVC _mm_prefetch доступна только на x86/x64; на остальных
+ * архитектурах подсказка предвыборки просто не используется. */
 #if LIBLZX_IS_MSVC_COMPILER
-#define prefetchr(addr)                _mm_prefetch((const char *)(addr), _MM_HINT_T0)
+#  if defined(_M_IX86) || defined(_M_X64)
+#    include <xmmintrin.h>
+#    define prefetchr(addr)        _mm_prefetch((const char *)(addr), _MM_HINT_T0)
+#  else
+#    define prefetchr(addr)        ((void)(addr))
+#  endif
 #else
 #define prefetchr(addr)                __builtin_prefetch((addr), 0)
 #endif
 
 /* Prefetch into L1 cache for write.  */
 #if LIBLZX_IS_MSVC_COMPILER
-#define prefetchw(addr)                _mm_prefetch((const char *)(addr), _MM_HINT_T0)
+#  if defined(_M_IX86) || defined(_M_X64)
+#    define prefetchw(addr)        _mm_prefetch((const char *)(addr), _MM_HINT_T0)
+#  else
+#    define prefetchw(addr)        ((void)(addr))
+#  endif
 #else
 #define prefetchw(addr)                __builtin_prefetch((addr), 1)
 #endif
