@@ -1,39 +1,353 @@
-# liblzx
-liblzx is a fork of wimlib's LZX compressor with changes to make it compatible
-with the CAB LZX format.
+# liblzx — LZX-сжатие и запись CAB-архивов
 
-It mainly exists to help improve the compression of MSI installers on
-non-Windows platforms.  Currently, both GNOME msitools and Wine's cabinet.dll
-(used by WiX Toolset) only support deflate compression, which is lower-quality
-and hampered by a restriction in the cabinet format that prevents
-deflate-compressed blocks from referencing data in previous blocks.
+Переносимая библиотека на C для сжатия LZX в варианте формата Microsoft
+Cabinet (CAB) и записи CAB-архивов, включая многотомные наборы. Не зависит
+от Windows API, zlib и Wine; собирается MSVC (Windows x64), gcc и clang
+(Linux).
 
-# LZX DELTA
-liblzx doesn't currently support LZX DELTA, used by the CreatePatchFileExA and
-CreatePatchFileExW functions.  It may in the future once some test scenarios
-are added.  This isn't currently possible because several internal structures
-have 21 bits of precision, which is just enough for CAB LZX's maximum window
-size of 2MB.
+Репозиторий — форк [elasota/liblzx](https://github.com/elasota/liblzx),
+компрессора LZX из [wimlib](https://wimlib.net), адаптированного автором
+оригинала к LZX для CAB. Предназначен для подключения субмодулем в
+[Cabine](https://github.com/roosslan/cabarc_tvision) — CAB-архиватор на
+Turbo Vision.
 
-LZX DELTA supports window sizes of up to 64MB, so liblzx would need an
-additional set of compression functions that can handle the increased offset
-precision.
+## Отличия от оригинала
 
-# Wine cabinet.dll patch
-The "winecabinet" dir is a patched version of Wine's cabinet.dll to support
-the updated FCI functions and liblzx's streaming behavior.
+Оригинал содержит компрессор и пропатченный cabinet.dll из Wine (FCI) с
+zlib для MSZIP, собирается только Visual Studio, а CAB-файл записывает код
+Wine. В этом форке:
 
-# Usage
-See the liblzx.h header file for usage.
+- удалены Wine (`wine/`, `winecabinet/`, `winecompat/`), zlib, пример
+  `minicab` на FCI из Wine и проекты Visual Studio (`*.sln`, `*.vcxproj`,
+  `*.props`);
+- добавлена сборка CMake (статические библиотеки, утилита, тесты) и CI
+  GitHub Actions для Windows и Linux;
+- добавлена собственная запись CAB-архивов (`cab/cabwriter.h`,
+  `cab/cabwriter.c`): методы «без сжатия» и LZX, многотомность,
+  потоковая подача данных, прогресс с отменой;
+- добавлена утилита-пример `lzxcab`;
+- исправлены ошибки компрессора (см. ниже) и устранены непереносимые
+  конструкции: `alloca`/`<malloc.h>`, порядок байт и `restrict` для MSVC,
+  которые раньше задавались в `.props`, `_mm_prefetch` вне x86;
+- генератор таблиц `log2calc` перенесён в `tools/log2calc` с пояснением.
 
-# Determinism
-liblzx uses some floating point math internally for the BT matchfinder.  As
-such it is dependent on floating point optimizations like "fast math" and
-the state of floating point control registers.
+### Исправленные ошибки компрессора
 
-If you care about output determinism, you should disable "fast math"
-optimizations and set the floating point control registers to set values
-before calling liblzx functions.
+Ошибки найдены тестами с распаковкой системными средствами и под
+AddressSanitizer/UndefinedBehaviorSanitizer:
 
-# License
-liblzx is licensed under GPLv3 or LGPLv3, same as the wimlib license.
+1. **Ленивый разбор (уровни 1…34) портил данные.** В
+   `hc_matchfinder_longest_match` при отсутствии совпадения длина
+   принудительно заменялась на 2 при смещении 0; ленивый разбор принимал
+   это за совпадение, и смещение 0 кодировалось как повтор R2. Распакованные
+   данные отличались парами байтов (и в FDI, и в cabextract).
+2. **Выход за границы таблиц matchfinder в потоковом режиме.** Таблицы
+   рассчитывались на 2·W позиций, а буфер компрессора содержит 2·W + 267
+   байт; при окне 32 Кб 16-битные позиции к тому же переполнялись (65536 →
+   0, 65535 совпадает с признаком пустой позиции). Теперь таблицы имеют
+   запас, а 16-битные позиции используются только вне потокового режима.
+3. **Бесконечный цикл и чтение за буфером** в `hc_matchfinder_skip_bytes`
+   при нулевой длине пропуска (совпадение длины 2 у конца фрагмента).
+4. **Недопустимые смещения при окнах 15…20:** компрессор допускал смещение
+   до `window_size`, а формат — только до `window_size − 3`; ограничение
+   применялось лишь к окну 21.
+5. **Деление на ноль** (аварийное завершение) при оценке стоимостей для
+   блока без совпадений на уровнях выше 34: в wimlib здесь было деление в
+   плавающей точке, а при переходе на фиксированную точку оно стало
+   целочисленным.
+6. **Потеря данных при переполнении выходного буфера:** если сжатый
+   фрагмент не помещался в 32768 + 6144 байт, `lzx_flush_output`
+   возвращала 0, и фрагмент молча пропадал. Теперь в этом случае, а также
+   когда сжатое представление длиннее исходного (несжимаемые данные),
+   записывается несжатый блок LZX.
+7. **`liblzx_compress_reset` не сбрасывал состояние потока:** после
+   `liblzx_compress_end_input` объект переставал принимать данные, а новый
+   поток не начинался с заголовка E8.
+8. **`fixed_sub` складывал вместо вычитания** при расчёте начальных
+   стоимостей; влияние на размер — доли процента.
+9. Неопределённое поведение: сдвиг влево отрицательного числа в
+   `log2_fixed_fast_normalized`.
+
+### Детерминированность
+
+Предупреждение оригинального README о зависимости результата от
+арифметики с плавающей точкой устарело: оценка стоимостей переведена на
+таблицы логарифма с фиксированной точкой (`log2_fixed_table_*`), и
+плавающая точка в сжатии не используется. Проверено: архивы одних и тех же
+данных, созданные сборками MSVC (Windows) и gcc (Linux), побайтно
+совпадают в области данных на уровнях 20, 50 и 100.
+
+## Сборка
+
+Требуется CMake 3.16+ и компилятор C11.
+
+Windows (Visual Studio 2022, x64):
+
+```bash
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake --build build --config Release
+ctest --test-dir build -C Release
+```
+
+Linux:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+ctest --test-dir build
+```
+
+Параметры CMake:
+
+| Параметр | По умолчанию | Назначение |
+|---|---|---|
+| `LIBLZX_BUILD_TOOLS` | ON при самостоятельной сборке | утилита `lzxcab` (и `cabbench` на Windows) |
+| `LIBLZX_BUILD_TESTS` | ON при самостоятельной сборке | тесты CTest |
+| `LIBLZX_WARNINGS_AS_ERRORS` | OFF | `/WX` или `-Werror` |
+
+Цели: `liblzx::liblzx` — компрессор LZX (файл `lzx.lib`/`liblzx.a`),
+`liblzx::cab` — запись CAB (зависит от компрессора).
+
+Подключение субмодулем:
+
+```cmake
+add_subdirectory(third_party/liblzx)
+target_link_libraries(myapp PRIVATE liblzx::cab)
+```
+
+При подключении через `add_subdirectory` утилита и тесты по умолчанию не
+собираются.
+
+Код собирается без предупреждений при `/W3` и `-Wall -Wextra`. Для
+компрессора под MSVC отключены только C4244 и C4267 — неявные сужающие
+преобразования ограниченных по построению значений в коде, унаследованном
+от wimlib (обоснование — в `CMakeLists.txt`).
+
+## Запись CAB-архива
+
+Заголовок `cab/cabwriter.h`. Порядок работы:
+
+```c
+#include "cabwriter.h"
+
+static int progress(void *ud, const liblzx_cab_progress_t *p)
+{
+        /* p->total_in — принято байт; ненулевой результат отменяет запись */
+        return 0;
+}
+
+int make_cab(void)
+{
+        liblzx_cab_properties_t props;
+        liblzx_cab_file_info_t info;
+        liblzx_cab_writer_t *w;
+        int err;
+
+        liblzx_cab_init_properties(&props);     /* LZX, окно 21, уровень 50 */
+        props.cab_path = "out/archive.cab";     /* UTF-8 */
+        props.lzx_window_bits = 21;             /* 15..21 */
+        props.volume_size = 1440 * 1024;        /* 0 — без деления на тома */
+        props.progress = progress;
+
+        w = liblzx_cab_create(&props, &err);
+        if (!w)
+                return err;
+
+        info.name = "Документы\\отчёт.txt";     /* UTF-8, разделитель «\» */
+        info.attribs = LIBLZX_CAB_ATTRIB_ARCHIVE;
+        info.dos_date = (46 << 9) | (10 << 5) | 16;   /* 2026-10-16 */
+        info.dos_time = (12 << 11) | (30 << 5);       /* 12:30:00 */
+        info.size = LIBLZX_CAB_SIZE_UNKNOWN;    /* или известный размер */
+
+        err = liblzx_cab_add_file_from_path(w, "/home/user/report.txt", &info);
+        /* либо: liblzx_cab_begin_file, liblzx_cab_write (порциями),
+         * liblzx_cab_end_file */
+        if (!err)
+                err = liblzx_cab_finish(w);
+        liblzx_cab_destroy(w);  /* без успешного finish удаляет все тома */
+        return err;
+}
+```
+
+Основные возможности и правила:
+
+- **Методы:** без сжатия (`LIBLZX_CAB_COMPRESS_NONE`, typeCompress = 0) и
+  LZX (`LIBLZX_CAB_COMPRESS_LZX`, typeCompress = 3 | (окно << 8)), окно
+  15…21. MSZIP не поддерживается.
+- **Уровень сжатия** (`compression_level`): до 34 включительно — быстрый
+  ленивый разбор, выше — близкий к оптимальному (по умолчанию 50).
+- **Имена** в UTF-8; для не-ASCII имён автоматически выставляется флаг
+  `_A_NAME_IS_UTF` (0x80); «/» заменяется на «\». Атрибуты, дата и время
+  MS-DOS задаются вызывающим.
+- **Потоковая подача:** данные файла подаются порциями (`liblzx_cab_write`)
+  или читаются с диска блоками по 64 Кб (`liblzx_cab_add_file_from_path`);
+  файл целиком в память не загружается. Сжатые блоки текущего тома
+  накапливаются во временном файле (`<cab_path>.tmp` или `temp_path`).
+- **Прогресс и отмена:** обратный вызов получает события «блок данных
+  записан», «прочитана порция файла», «том записан»; ненулевой результат
+  отменяет запись с кодом `LIBLZX_CAB_ERR_CANCELLED`.
+- **Многотомность:** `volume_size` задаёт наибольший размер тома. Следующие
+  тома называются по шаблону `<имя>2.cab`, `<имя>3.cab`… либо по обратному
+  вызову `volume_name` (он же задаёт имена дисков). Тома согласованы по
+  `setID`, `iCabinet` и полям предыдущего/следующего тома; файл, разорванный
+  между томами, помечается 0xFFFE/0xFFFD/0xFFFF, блок CFDATA разрезается
+  между томами (часть с `cbUncomp = 0`), как у FCI.
+- **Уменьшенный первый том:** `first_volume_reserve` уменьшает первый том
+  на заданное число байт — для самораспаковывающегося архива, где
+  программа-распаковщик вместе с первым томом должна укладываться в размер
+  тома.
+- **Папки:** все файлы по умолчанию сжимаются одним потоком LZX (одна
+  папка). Новая папка начинается по `liblzx_cab_flush_folder`, по порогу
+  `folder_size_threshold`, если файл известного размера не помещается в
+  папку, и после разрыва папки между томами.
+- **Ввод-вывод** по умолчанию — stdio (на Windows пути UTF-8
+  преобразуются в UTF-16 и открываются через `_wfopen`); его можно
+  заменить своими функциями (`liblzx_cab_io_t`).
+- **Ошибки:** все функции возвращают `LIBLZX_CAB_OK` или отрицательный код
+  `liblzx_cab_error`; `liblzx_cab_strerror` даёт описание. После первой
+  ошибки объект остаётся в состоянии ошибки, а `liblzx_cab_destroy`
+  удаляет временный файл и все созданные тома; утечек памяти нет (проверено
+  LeakSanitizer, в том числе при отмене).
+
+### Ограничения
+
+- Файл должен помещаться в одну папку: не более 65534 блоков по 32 Кб
+  (около 2 Гб). Том — не более 0x7FFFFFFF байт, не более 65535 записей
+  CFFILE в томе, не более 65536 томов.
+- Если размер файла не задан (`LIBLZX_CAB_SIZE_UNKNOWN`) и файл оказался
+  разорван между томами, поле его размера в уже записанных томах
+  исправляется после окончания файла (нужна функция `seek`). Для дисков,
+  которые меняются по ходу записи, размер файлов следует задавать заранее.
+- Для распаковки средствами Windows том должен быть больше наибольшего
+  блока CFDATA, рекомендуется не меньше 64 Кб
+  (`LIBLZX_CAB_MIN_FDI_VOLUME_SIZE`): блок, разрезанный более чем на два
+  тома, FDI (cabinet.dll) не собирает — это проверено и на наборах,
+  созданных makecab. cabextract такие наборы распаковывает.
+- `expand.exe` не распаковывает многотомные наборы (ошибка 0x80070032,
+  в том числе на наборах makecab); их распаковывают FDI (cabinet.dll) и
+  cabextract.
+- Не поддерживаются MSZIP, Quantum, LZX DELTA, зарезервированные области
+  (`cbCFHeader` и т. п.) и подпись.
+
+## API компрессора LZX
+
+Заголовок `liblzx/liblzx.h` (без изменений интерфейса):
+`liblzx_compress_create`, `liblzx_compress_add_input`,
+`liblzx_compress_get_next_chunk`, `liblzx_compress_release_next_chunk`,
+`liblzx_compress_end_input`, `liblzx_compress_reset`,
+`liblzx_compress_destroy`. Компрессор выдаёт сжатые фрагменты,
+соответствующие 32 Кб несжатых данных (последний — меньше); каждый
+фрагмент — содержимое одного блока CFDATA. Для CAB следует указывать
+`LIBLZX_VARIANT_CAB_DELTA`, `chunk_granularity = 32768` и окно до 2 Мб.
+
+## Утилита lzxcab
+
+```
+lzxcab [параметры] <архив.cab> <файл|директория>...
+  -m none|lzx   метод сжатия (по умолчанию lzx)
+  -w 15..21     размер окна LZX в битах (по умолчанию 21)
+  -l N          уровень сжатия (по умолчанию 50)
+  -v РАЗМЕР     размер тома (суффиксы K, M, G)
+  -r РАЗМЕР     уменьшить первый том на РАЗМЕР байт
+  -f РАЗМЕР     порог размера папки
+  -s ЧИСЛО      идентификатор набора томов (setID)
+  -e            отключить E8-трансляцию
+  -q            не выводить прогресс
+```
+
+Директории добавляются рекурсивно; в архиве сохраняются пути относительно
+родительской директории аргумента. Например, для создания набора томов по
+1,44 Мб с уменьшенным на 100 Кб первым томом:
+
+```bash
+lzxcab -v 1440K -r 100K backup.cab Документы
+```
+
+## Тесты
+
+`tests/cabtest.c` — сценарии CTest: архив создаётся библиотекой,
+распаковывается внешними средствами и сверяется побайтно. На Windows
+используется FDI (cabinet.dll) и `expand.exe -F:*` (для однотомных
+архивов), на Linux — cabextract (libmspack; путь можно задать
+переменной `LZX_CABEXTRACT`).
+
+| Сценарий | Что проверяется |
+|---|---|
+| `basic` | LZX и без сжатия; чтение с диска и подача порциями случайной длины |
+| `windows` | окна 15…21 на данных с повторами на расстояниях W−4…W+1 |
+| `levels` | уровни 1, 10, 34, 35, 70, 100, 300 |
+| `multivolume` | тома 64 Кб, 100 Кб, 300 Кб; разорванные файлы; окно 15 |
+| `tiny` | тома меньше блока: блоки на 3+ томах, файлы через много томов |
+| `reserve` | уменьшенный первый том |
+| `names` | кириллические и японские имена, поддиректории, «/» → «\» |
+| `empty` | пустые файлы, архив только из пустых файлов, сброс папок |
+| `e8` | x86-код 14 Мб (больше `e8_file_size` = 12 Мб), системные exe/dll; E8 включена и выключена |
+| `random` | несжимаемые данные |
+| `unknown_size` | неизвестный размер файлов при многотомности |
+| `folders` | папка на каждый файл и по порогу (повторное использование компрессора) |
+| `cancel` | отмена на разных этапах, удаление томов и временного файла |
+| `errors` | неверные параметры, порядок вызовов, имена, размеры, малый том |
+| `raw_*` | несжатые блоки LZX в каждом третьем фрагменте (сборка с `LIBLZX_TEST_FORCE_UNCOMPRESSED`) |
+
+CI (GitHub Actions) собирает и тестирует проект на windows-latest (MSVC),
+ubuntu-latest (gcc и clang) и отдельно под ASan/UBSan.
+
+## Сравнение с cabinet.dll
+
+Замер программой `tools/cabbench` (собирается на Windows вместе с
+утилитами): один и тот же набор файлов упаковывается в однотомный CAB с
+LZX через FCI (cabinet.dll, Windows 10 22H2) и через liblzx, время — полное
+время создания архива. Компьютер — 16 логических процессоров, сжатие
+однопоточное. Размер — доля от исходного объёма.
+
+Повторяющийся журнал (64 Мб однотипных строк):
+
+| окно | cabinet.dll | liblzx, ур. 20 | liblzx, ур. 50 | liblzx, ур. 100 |
+|---|---|---|---|---|
+| 15 | 6,88 %, 11,8 с | 7,09 %, 1,7 с | 7,28 %, 9,0 с | 6,14 %, 24,3 с |
+| 18 | 6,84 %, 77,5 с | 7,48 %, 2,2 с | 7,27 %, 10,0 с | 6,33 %, 32,0 с |
+| 21 | 6,84 %, **842,8 с** | 7,93 %, 7,5 с | 7,38 %, 12,6 с | 6,18 %, 38,2 с |
+
+Текст и исходники (48 Мб, 1082 файла заголовков Windows SDK):
+
+| окно | cabinet.dll | liblzx, ур. 20 | liblzx, ур. 50 | liblzx, ур. 100 |
+|---|---|---|---|---|
+| 15 | 6,44 %, 7,2 с | 7,06 %, 1,2 с | 6,97 %, 5,6 с | 6,76 %, 11,8 с |
+| 18 | 5,55 %, 7,5 с | 6,09 %, 0,5 с | 6,00 %, 4,3 с | 5,70 %, 7,6 с |
+| 21 | 5,38 %, 7,0 с | 5,87 %, 0,7 с | 5,81 %, 4,6 с | 5,43 %, 8,5 с |
+
+Исполняемые файлы (48 Мб, 132 exe/dll из System32):
+
+| окно | cabinet.dll | liblzx, ур. 20 | liblzx, ур. 50 | liblzx, ур. 100 |
+|---|---|---|---|---|
+| 15 | 37,39 %, 7,4 с | 38,77 %, 1,7 с | 37,50 %, 5,4 с | 37,38 %, 8,3 с |
+| 18 | 35,05 %, 10,3 с | 36,64 %, 1,6 с | 35,17 %, 6,4 с | 35,03 %, 12,2 с |
+| 21 | 31,38 %, 18,2 с | 33,96 %, 4,7 с | 32,11 %, 9,9 с | 31,95 %, 14,2 с |
+
+Случайные данные (16 Мб): все варианты дают 100,05…100,21 %; liblzx на
+всех окнах и уровнях — 100,07 % (несжимаемые фрагменты записываются
+несжатыми блоками LZX), время 1,2…10,9 с, cabinet.dll — 1,7…9,2 с.
+
+Выводы:
+
+- на сильно повторяющихся данных cabinet.dll с большим окном крайне
+  медленный: при окне 21 — 14 минут на 64 Мб, liblzx — 7…38 с, а на
+  уровне 100 архив ещё и на 10 % меньше;
+- на обычных данных liblzx на уровне 100 сжимает почти так же, как
+  cabinet.dll (архив больше на 0,8 % для текста и на 1,8 % для exe/dll при
+  окне 21; при окнах 15 и 18 на exe/dll — не больше), при сравнимом
+  времени; уровень 50 (по умолчанию) быстрее, но архив больше на 2…8 %;
+- уровень 20 (быстрый ленивый разбор) в 4…10 раз быстрее cabinet.dll на
+  обычных данных при архиве на 8…16 % больше.
+
+Для Cabine разумно предлагать уровень 100 как «максимальное сжатие» и 20…50
+как «быстрое».
+
+## Лицензия
+
+GNU Lesser General Public License 2.1 или более поздней версии (файл
+`liblzx/COPYING`; так же лицензированы код wimlib и оригинальной liblzx —
+прежний README ошибочно указывал GPLv3/LGPLv3). Новый код форка
+распространяется на тех же условиях. Заголовки `liblzx_compiler.h`,
+`liblzx_bitops.h` и некоторые другие из wimlib дополнительно доступны по
+лицензии MIT, указанной в самих файлах.
