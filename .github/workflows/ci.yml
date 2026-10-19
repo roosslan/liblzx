@@ -1,0 +1,70 @@
+name: Сборка и тесты
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    name: Windows (MSVC x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Конфигурация
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DLIBLZX_WARNINGS_AS_ERRORS=ON
+
+      - name: Сборка
+        run: cmake --build build --config Release --parallel
+
+      - name: Тесты (FDI и expand.exe)
+        run: ctest --test-dir build -C Release --output-on-failure --parallel 4 --timeout 3000
+
+  linux:
+    name: Linux (${{ matrix.compiler }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Установка cabextract
+        run: sudo apt-get update && sudo apt-get install -y cabextract ninja-build
+
+      - name: Конфигурация
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_COMPILER=${{ matrix.compiler }}
+          -DLIBLZX_WARNINGS_AS_ERRORS=ON
+
+      - name: Сборка
+        run: cmake --build build --parallel
+
+      - name: Тесты (cabextract)
+        run: ctest --test-dir build --output-on-failure --parallel 4 --timeout 3000
+
+  sanitizers:
+    name: Linux (ASan + UBSan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Установка cabextract
+        run: sudo apt-get update && sudo apt-get install -y cabextract ninja-build
+
+      - name: Конфигурация
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_COMPILER=clang
+          "-DCMAKE_C_FLAGS=-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer"
+
+      - name: Сборка
+        run: cmake --build build --parallel
+
+      - name: Тесты
+        run: ctest --test-dir build --output-on-failure --parallel 4 --timeout 3000
