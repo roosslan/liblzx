@@ -81,10 +81,10 @@ AddressSanitizer/UndefinedBehaviorSanitizer:
 
 Требуется CMake 3.16+ и компилятор C11.
 
-Windows (Visual Studio 2022, x64):
+Windows (Visual Studio 2022 или новее, x64; генератор CMake выбирает установленную версию):
 
 ```bash
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake -S . -B build -A x64
 cmake --build build --config Release
 ctest --test-dir build -C Release
 ```
